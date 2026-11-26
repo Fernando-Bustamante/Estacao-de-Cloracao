@@ -35,8 +35,11 @@ def degraus(lista):
 
 
 def par(t_fim, pert=None, **perfis):
-    """Roda o cenario com as duas estruturas."""
-    rm = s.simular(p, t_fim, M.ControleMPC(p, Ts, **perfis), perturbacao=pert, Ts=Ts)
+    """Roda o cenario com as duas estruturas. rm['eventos'] guarda as trocas
+    automaticas do MPC para a contingencia (t, tanque, causa)."""
+    cm = M.ControleMPC(p, Ts, **perfis)
+    rm = s.simular(p, t_fim, cm, perturbacao=pert, Ts=Ts)
+    rm["eventos"] = cm.eventos
     rc = s.simular(p, t_fim, c.Contingencia(p, Ts, **perfis), perturbacao=pert, Ts=Ts)
     return rm, rc
 
@@ -107,6 +110,11 @@ ax[0].text(T_ON / 60 + 4, 2.45, "rede pressurizada ($h_j$ = 2,6 m)", ha="left", 
 ax[0].set_ylim(1.55, 2.78)
 tracar(ax[1], rm5, rc5, ("u", s.PAC), "$u_1$ (bomba de água)")
 tracar(ax[2], rm5, rc5, ("u", s.VC1), "$u_3$ (válvula de descarga)")
+for te, tq, causa in rm5["eventos"]:
+    for a in ax:
+        a.axvline(te / 60, color=AZUL, lw=1, ls=(0, (2, 2)))
+    ax[0].text(te / 60 + 2, 1.62, f"QP do MPC falha:\ntroca automática\n({te / 60:.1f} min)".replace(".", ","),
+               ha="left", va="bottom", fontsize=8, color=AZUL)
 ax[0].set_title("Falha: aumento da pressão da rede entre 10 min e 4 h (R6)", loc="left", fontsize=10)
 ax[2].set_xlabel("tempo [min]")
 ax[2].set_xlim(0, 360)
@@ -121,6 +129,8 @@ def acom(t, y, ti, alvo, fx):
     return (t[j][fora[-1]] - ti) / 60 if len(fora) else 0.0
 
 
+for nome, r in (("C_ref", rm1), ("k_d", rm2), ("h_ref", rm3), ("producao", rm4), ("rede", rm5)):
+    print(f"  trocas automaticas do MPC no cenario {nome}: {r['eventos']}")
 print("                          MPC                     contingencia")
 for nome, (rm, rc), sx, alvo, fx in (
         ("R2 ts (min)", (rm1, rc1), s.CC, 2.2, 0.004),

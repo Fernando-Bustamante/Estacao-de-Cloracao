@@ -25,7 +25,10 @@ A tela mostra o processo em funcionamento, com gráficos de nível, cloro e coma
 - mudar as referências de cloro, nível e produção;
 - aplicar perturbações (consumo de cloro, concentração do hipoclorito, pressão da rede);
 - simular a falha da válvula de descarga travada;
+- simular a falha do otimizador do MPC ou do analisador de cloro do tanque C ("Otimizador C falha", "Analisador C sem sinal"): com o MPC ligado, a estação passa sozinha à contingência, sem salto nos comandos, e o seletor do topo muda para "Contingência (PI)";
 - usar os cenários prontos ("Rede pressurizada", "Cloro +0,2 mg/L", "Tudo nominal").
+
+O MPC também troca sozinho para a contingência quando o otimizador deixa de convergir de verdade, como acontece no cenário "Rede pressurizada".
 
 O quadro "O que está acontecendo" explica cada decisão do controle, e passar o mouse sobre um equipamento mostra a função dele. As perturbações agem só no tanque C, e o tanque D serve de comparação.
 
@@ -34,8 +37,8 @@ O quadro "O que está acontecendo" explica cada decisão do controle, e passar o
 - `sinotico.py`: tela interativa
 - `simulador.py`: modelo não linear da planta e do analisador de cloro
 - `controladores.py`: PIs, controle de razão, override e a estrutura de contingência
-- `mpc.py`: MPC adaptativo com filtro de Kalman
-- `parte1_validacao.py` a `parte7_cenarios.py`: scripts que reproduzem os números e as figuras do relatório
+- `mpc.py`: MPC adaptativo com filtro de Kalman e troca automática para a contingência
+- `parte1_validacao.py` a `parte8_troca.py`: scripts que reproduzem os números e as figuras do relatório
 
 ## Autores
 

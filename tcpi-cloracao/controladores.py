@@ -8,6 +8,12 @@ import math
 import simulador as s
 
 
+def medida_valida(Cm, faixa=(0.0, 20.0)):
+    """Sinal do analisador utilizavel: finito (NaN representa a quebra do
+    sinal 4-20 mA) e dentro da faixa do instrumento."""
+    return Cm is not None and math.isfinite(Cm) and faixa[0] <= Cm <= faixa[1]
+
+
 class PI:
     """PI digital (forma posicional, integral por Euler) com anti-windup por
     recalculo (back-calculation). A saida e  u = u_ff + Kc*e + I, saturada em
@@ -139,7 +145,11 @@ class ControleCloro:
 
     Anti-windup: a integral para quando u2 satura, quando a dose atinge seus
     limites [0, D_max] ou quando nao ha vazao de agua (u1 < 5% do nominal),
-    caso em que u2 = k u1 D fica preso em zero sem nunca saturar."""
+    caso em que u2 = k u1 D fica preso em zero sem nunca saturar.
+
+    Falha do analisador (medida invalida): o AIC passa a manual com a ultima
+    dose, e a razao continua dosando proporcionalmente a vazao. Quando a
+    medida volta, a integral e recalculada para retomar sem salto."""
 
     def __init__(self, p, sint, Ts=30.0, tanque="C", escalonar=True):
         _, u0 = s.ponto_operacao(p)
@@ -154,11 +164,20 @@ class ControleCloro:
         self.ih, self.ic = ("hC", "CmC") if tanque == "C" else ("hD", "CmD")
         self.u1_min = 0.05 * u0[self.i1]
         self.D = sint["D"]
+        self.manual = False
+
+    def fator(self, h):
+        return s.volume(self.p, h) / self.Vnom if self.escalonar else 1.0
 
     def atualizar(self, med, u):
+        if not medida_valida(med[self.ic]):
+            self.manual = True                     # AIC em manual: mantem a dose
+            u[self.i2] = min(max(self.k * u[self.i1] * self.D, 0.0), 1.0)
+            return u
         e = self.ref - med[self.ic]
-        f = s.volume(self.p, med[self.ih]) / self.Vnom if self.escalonar else 1.0
-        Kc = self.Kc * f
+        Kc = self.Kc * self.fator(med[self.ih])
+        if self.manual:                            # volta ao automatico sem salto
+            self.I, self.manual = self.D - Kc * e, False
         D_calc = Kc * e + self.I
         D = min(max(D_calc, 0.0), self.D_max)
         u2_calc = self.k * u[self.i1] * D
@@ -248,12 +267,34 @@ class Contingencia:
         self.aic = {k: ControleCloro(p, self.sint["cloro"], Ts, k, escalonar) for k in "CD"}
         self.ovr = {k: Override(p, self.sint["override"], Ts, k, override) for k in "CD"}
 
+    def tanque(self, k, t, med, u):
+        """Um ciclo de um tanque: seletor/override (u1) -> LIC (u3) -> AIC/FY (u2)."""
+        i1 = s.PAC if k == "C" else s.PAD
+        u[i1] = self.ovr[k].selecionar(med, self.u0[i1] * self.prod(t))
+        self.lic[k].ref = self.href(t)
+        self.aic[k].ref = self.Cref(t)
+        u = self.lic[k].atualizar(med, u)
+        return self.aic[k].atualizar(med, u)
+
+    def inicializar(self, k, t, med, u):
+        """Troca sem salto: os integradores do tanque k partem dos comandos
+        que estao sendo aplicados (u), para que a primeira saida da
+        contingencia repita esses comandos."""
+        lic, aic, ovr = self.lic[k], self.aic[k], self.ovr[k]
+        lic.ref, aic.ref = self.href(t), self.Cref(t)
+        lic.pi.I = u[lic.iu] - lic.pi.Kc * (lic.ref - med[lic.ih])
+        u1 = u[aic.i1]
+        D = u[aic.i2] / (aic.k * u1) if u1 > aic.u1_min else aic.D
+        aic.D = min(max(D, 0.0), aic.D_max)
+        if medida_valida(med[aic.ic]):
+            aic.I = aic.D - aic.Kc * aic.fator(med[aic.ih]) * (aic.ref - med[aic.ic])
+            aic.manual = False
+        else:
+            aic.I, aic.manual = aic.D, True
+        ovr.F = u1
+
     def __call__(self, t, med, u):
         u = u.copy()
-        for k, i1 in (("C", s.PAC), ("D", s.PAD)):
-            u[i1] = self.ovr[k].selecionar(med, self.u0[i1] * self.prod(t))
-            self.lic[k].ref = self.href(t)
-            self.aic[k].ref = self.Cref(t)
-            u = self.lic[k].atualizar(med, u)
-            u = self.aic[k].atualizar(med, u)
+        for k in "CD":
+            u = self.tanque(k, t, med, u)
         return self.resv.atualizar(med, u)

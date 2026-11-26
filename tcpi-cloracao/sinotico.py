@@ -72,8 +72,11 @@ class Processo:
         self.sp = {"Cref": p.C_nom, "href": p.h_nom, "prod": 1.0}
         self.pert = {"kd": 1.0, "CB": 100.0, "hj": 0.0}
         self.valvula_travada = False
+        self.falha_qp = False          # otimizador do MPC do tanque C nao converge
+        self.falha_at = False          # analisador do tanque C sem sinal (NaN)
         self.estrutura = estrutura
         self.ctl = self._criar(estrutura)
+        self._n_trocas = 0
         self.hist = deque(maxlen=5000)
         self.limite = {"C": False, "D": False}
         self.alarmes = {}
@@ -91,14 +94,18 @@ class Processo:
     def medidas(self):
         x = self.x
         return {"hA": x[s.HA], "hB": x[s.HB], "hC": x[s.HC], "hD": x[s.HD],
-                "CmC": self.anaC.y, "CmD": self.anaD.y}
+                "CmC": math.nan if self.falha_at else self.anaC.y, "CmD": self.anaD.y}
 
-    def trocar(self, e):
+    def modo(self, k):
+        """Quem comanda o tanque k agora: 'MPC' ou 'contingencia'."""
+        return self.ctl.modo[k] if self.estrutura == "MPC" else "contingencia"
+
+    def trocar(self, e, aviso=True):
         """Troca a estrutura inicializando os integradores do novo controlador
         com os comandos que estao sendo aplicados agora."""
         if e == self.estrutura:
             return
-        novo, med, u, p = self._criar(e), self.medidas(), self.u, self.p
+        novo, med, u = self._criar(e), self.medidas(), self.u
         novo.resv = self.ctl.resv
         if e == "MPC":
             for k, m in novo.mpc.items():
@@ -107,23 +114,31 @@ class Processo:
                 m.x = np.array([med[m.ih], Cm, Cm, Cm, Cm, 0.0, 0.0])
         else:
             for k in "CD":
-                lic, aic = novo.lic[k], novo.aic[k]
-                lic.pi.I = u[lic.iu] - lic.pi.Kc * (self.sp["href"] - med[lic.ih])
-                u1 = u[aic.i1]
-                D = u[aic.i2] / (aic.k * u1) if u1 > aic.u1_min else aic.D
-                D = min(max(D, 0.0), aic.D_max)
-                f = s.volume(p, med[aic.ih]) / aic.Vnom
-                aic.I, aic.D = D - aic.Kc * f * (self.sp["Cref"] - med[aic.ic]), D
-                novo.ovr[k].F = u1
+                novo.inicializar(k, self.t, med, u)
         self.ctl, self.estrutura = novo, e
         self.limite = {"C": False, "D": False}
+        self._n_trocas = 0
         nome = "MPC adaptativo" if e == "MPC" else "contingência"
-        self.evento(f"Estrutura trocada para {nome}. Os integradores do novo controlador partiram "
-                    "dos comandos atuais; mudanças depois disso são decisões da nova estrutura.")
+        if aviso:
+            self.evento(f"Estrutura trocada para {nome}. Os integradores do novo controlador partiram "
+                        "dos comandos atuais; mudanças depois disso são decisões da nova estrutura.")
 
     def _avisos_controle(self):
+        if self.estrutura == "MPC" and self.ctl.eventos:
+            # troca automatica: o MPC do tanque com falha ja passou a contingencia;
+            # na tela, a estacao inteira passa, para o seletor do topo refletir o estado
+            _, k, causa = self.ctl.eventos[0]
+            self.trocar("CONT", aviso=False)
+            self.evento(f"TROCA AUTOMÁTICA: falha do {causa} do tanque {k}. A estação passou à "
+                        "contingência (PI), sem salto nos comandos. Para voltar, selecione "
+                        "MPC adaptativo depois de resolver a falha.", "alarme")
         for k, i1 in (("C", s.PAC), ("D", s.PAD)):
-            if self.estrutura == "MPC":
+            if self.estrutura == "MPC" and self.ctl.modo[k] != "MPC":
+                atuando = self.ctl.cont.ovr[k].selecionado
+                on = (f"Override do tanque {k}: o nível passou de 2,63 m e o seletor LS "
+                      "entregou a bomba de água ao LC-HH.")
+                off = f"Override do tanque {k} liberado: a bomba de água voltou a seguir a produção."
+            elif self.estrutura == "MPC":
                 m = self.ctl.mpc[k]
                 h = self.x[s.HC if k == "C" else s.HD]
                 atuando = m.u_prev[0] < 0.85 * m.u1_prod and (m.u_prev[2] > 0.95 or h > 2.5)
@@ -149,6 +164,8 @@ class Processo:
 
     def passo(self):
         if self.t % int(self.TS) == 0:
+            if self.estrutura == "MPC":
+                self.ctl.mpc["C"].falha_simulada = self.falha_qp
             u = np.clip(np.asarray(self.ctl(self.t, self.medidas(), self.u.copy()), float), 0.0, 1.0)
             if self.valvula_travada:
                 u[s.VC1] = 0.0
@@ -359,6 +376,12 @@ class Sinotico:
         self.trava = tk.BooleanVar(value=False)
         ttk.Checkbutton(f3, text="VC1 travada", variable=self.trava,
                         command=self._travar).pack(anchor="w", pady=(0, 2))
+        self.fqp = tk.BooleanVar(value=False)
+        ttk.Checkbutton(f3, text="Otimizador C falha", variable=self.fqp,
+                        command=self._falhar_qp).pack(anchor="w", pady=(0, 2))
+        self.fat = tk.BooleanVar(value=False)
+        ttk.Checkbutton(f3, text="Analisador C sem sinal", variable=self.fat,
+                        command=self._falhar_at).pack(anchor="w", pady=(0, 2))
         ttk.Button(f3, text="Rede pressurizada",
                    command=lambda: self._aplicar("hj", 2.6)).pack(fill="x", pady=1)
         ttk.Button(f3, text="Cloro +0,2 mg/L",
@@ -431,7 +454,31 @@ class Sinotico:
             var.set(ini)
         self.trava.set(False)
         self.proc.valvula_travada = False
+        self.fqp.set(False)
+        self.fat.set(False)
+        self.proc.falha_qp = self.proc.falha_at = False
         self.proc.evento("Referências, perturbações e falhas voltaram ao nominal.")
+
+    def _falhar_qp(self):
+        on = self.fqp.get()
+        self.proc.falha_qp = on
+        if not on:
+            txt = ("Otimizador do tanque C voltou a funcionar. A estação segue na contingência até o "
+                   "operador selecionar MPC adaptativo.")
+        elif self.proc.modo("C") == "MPC":
+            txt = "Falha: o otimizador (QP) do MPC do tanque C deixou de convergir."
+        else:
+            txt = ("Falha do otimizador do tanque C ligada. A estação já está na contingência; "
+                   "se o MPC for selecionado, a troca automática volta a acontecer.")
+        self.proc.evento(txt, "alarme" if on else "")
+
+    def _falhar_at(self):
+        on = self.fat.get()
+        self.proc.falha_at = on
+        self.proc.evento("Falha: o analisador de cloro do tanque C ficou sem sinal. O AIC passa a manual "
+                         "com a última dose." if on else
+                         "Analisador do tanque C voltou. O AIC retoma o automático sem salto.",
+                         "alarme" if on else "")
 
     def _travar(self):
         self.proc.valvula_travada = self.trava.get()
@@ -485,6 +532,10 @@ class Sinotico:
             while self.acum >= 1.0 and time.perf_counter() < limite:
                 self.proc.passo()
                 self.acum -= 1.0
+        if self.estrutura.get() != self.proc.estrutura:     # houve troca automatica
+            self.estrutura.set(self.proc.estrutura)
+            self._texto_estrutura()
+            self.desenhar()
         self.animar(dt_real if self.rodando else 0.0)
         self.atualizar_dinamico()
         self._descarregar_eventos()
@@ -744,7 +795,8 @@ class Sinotico:
         r = 12.5
         self.ids[tg] = cv.create_oval(*self.pts(x - r, y - r, x + r, y + r), fill=EQUIP, outline=CONTORNO,
                                       width=max(1, round(1.4 * k)), tags=tg)
-        cv.create_text(*self.P(x, y), text=txt, font=self.F(8.5, "bold"), fill=TEXTO, tags=tg)
+        self.ids["bt" + alvo] = cv.create_text(*self.P(x, y), text=txt, font=self.F(8.5, "bold"),
+                                               fill=TEXTO, tags=tg)
         self._dica(tg, lambda c_=txt: c_, bolha=True)
 
     # ------------------------------------------------- atualizacao
@@ -810,7 +862,9 @@ class Sinotico:
             cv.itemconfigure(self.ids["h" + nome], text=f"h = {br(h)} m", fill=ALARME if alto else TEXTO)
             fora = not 0.2 <= C <= 5.0
             cv.itemconfigure(self.ids["c" + nome], text=f"C = {br(C)} mg/L", fill=ALARME if fora else TEXTO)
-            cv.itemconfigure(self.ids["at" + nome], text=f"{br(Cm)} mg/L")
+            sem_sinal = nome == "C" and pr.falha_at
+            cv.itemconfigure(self.ids["at" + nome], text="sem sinal" if sem_sinal else f"{br(Cm)} mg/L",
+                             fill=ALARME if sem_sinal else TEXTO)
             hr = pr.sp["href"]
             rr = s.raio(p, hr) * e
             ys = yb - hr * e
@@ -835,6 +889,14 @@ class Sinotico:
         # bolhas em destaque quando o limite de nivel esta atuando
         for tq, alvo in (("C", "bPAC"), ("D", "bPAD")):
             cv.itemconfigure(self.ids[alvo], fill=ATENCAO if pr.limite[tq] else EQUIP)
+        # quem comanda cada atuador (um tanque pode ter trocado sozinho para a contingencia)
+        for tq, alvos in (("C", (("PAC", "LS"), ("PBC", "FY"), ("VC1", "LIC"))),
+                          ("D", (("PAD", "LS"), ("PBD", "FY"), ("VD1", "LIC")))):
+            mpc_tq = pr.modo(tq) == "MPC"
+            trocou = pr.estrutura == "MPC" and not mpc_tq
+            for alvo, ctl in alvos:
+                cv.itemconfigure(self.ids["bt" + alvo], text="MPC" if mpc_tq else ctl,
+                                 fill=ALARME if trocou else TEXTO)
 
     # ------------------------------------------------------- graficos
     def _graficos(self, pai):

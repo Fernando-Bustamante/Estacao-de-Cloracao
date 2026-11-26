@@ -69,6 +69,7 @@ class MPC:
         self._cache = {}
         self.eps = 0.0
         self.solver_ok = True
+        self.falha_simulada = False   # testes e tela: o QP "nao converge"
 
     # ------------------------------------------------------------ modelo
     def _linearizar(self, h):
@@ -129,6 +130,9 @@ class MPC:
 
     # ------------------------------------------------------------- passo
     def passo(self, med):
+        if self.falha_simulada:                 # mesmo caminho de uma falha real do OSQP
+            self.solver_ok = False
+            return self.u_prev.copy()
         p, w, Np, Nc = self.p, self.w, self.Np, self.Nc
         y = np.array([med[self.ih], med[self.ic]])
         mod = self._modelo(med[self.ih])
@@ -204,9 +208,19 @@ class MPC:
 
 
 class ControleMPC:
-    """MPC nos tanques C e D + LIC-A/LIC-B com feedforward nos reservatorios."""
+    """MPC nos tanques C e D + LIC-A/LIC-B com feedforward nos reservatorios.
 
-    def __init__(self, p, Ts=30.0, Cref=None, href=None, prod=None, **kw):
+    Troca automatica (troca_automatica=True): se o QP de um tanque falha ou
+    se o sinal do seu analisador fica invalido, aquele tanque passa a
+    estrutura de contingencia no mesmo instante de amostragem, com os
+    integradores inicializados pelos comandos que estavam sendo aplicados
+    (sem salto). Na falha do analisador o AIC entra em manual com a ultima
+    dose. O outro tanque continua no MPC. A volta ao MPC e decisao do
+    operador (nova instancia). Cada troca fica registrada em self.eventos
+    como (t, tanque, causa)."""
+
+    def __init__(self, p, Ts=30.0, Cref=None, href=None, prod=None,
+                 troca_automatica=True, **kw):
         import controladores as c
         self.p = p
         _, self.u0 = s.ponto_operacao(p)
@@ -216,14 +230,35 @@ class ControleMPC:
         st = c.sintonias_padrao(p, Ts)
         self.resv = c.ControleReservatorios(p, st["A"], st["B"], Ts)
         self.mpc = {k: MPC(p, Ts, tanque=k, **kw) for k in "CD"}
+        self.troca_automatica = troca_automatica
+        self.cont = c.Contingencia(p, Ts, st, self.Cref, self.href, self.prod) \
+            if troca_automatica else None
+        self.modo = {"C": "MPC", "D": "MPC"}
+        self.eventos = []
 
     def __call__(self, t, med, u):
+        import controladores as c
         u = u.copy()
         for k in "CD":
             m = self.mpc[k]
-            m.h_ref, m.C_ref = self.href(t), self.Cref(t)
-            m.u1_prod = self.u0[s.PAC] * self.prod(t)
-            uk = m.passo(med)
-            for i, val in zip(m.iu, uk):
-                u[i] = val
+            if self.modo[k] == "MPC":
+                causa = None
+                if self.troca_automatica and not c.medida_valida(med[m.ic]):
+                    causa = "analisador"
+                else:
+                    m.h_ref, m.C_ref = self.href(t), self.Cref(t)
+                    m.u1_prod = self.u0[s.PAC] * self.prod(t)
+                    uk = m.passo(med)
+                    if self.troca_automatica and not m.solver_ok:
+                        causa = "otimizador"
+                    else:
+                        for i, val in zip(m.iu, uk):
+                            u[i] = val
+                if causa:
+                    # u ainda contem os comandos aplicados ate agora
+                    self.cont.inicializar(k, t, med, u)
+                    self.modo[k] = "contingencia"
+                    self.eventos.append((t, k, causa))
+            if self.modo[k] != "MPC":
+                u = self.cont.tanque(k, t, med, u)
         return self.resv.atualizar(med, u)
